@@ -246,6 +246,70 @@ jobs:
           chmod +x ../common/ksu_susfs_fixup.sh
           (cd ../common && ./ksu_susfs_fixup.sh ../KernelSU/kernel sukisu)
 
+          # Current SukiSU already contains several functions that the generic
+          # compatibility script may inject again. Remove only duplicate full
+          # definitions, retaining the first native definition.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('kernel')
+
+          def remove_duplicate_functions(path, function):
+              p = root / path
+              text = p.read_text()
+              pattern = re.compile(r'(?m)^[^\n;]*\b' + re.escape(function) + r'\s*\([^;]*?\)\s*\{')
+              matches = list(pattern.finditer(text))
+              if len(matches) <= 1:
+                  return
+              for match in reversed(matches[1:]):
+                  start = match.start()
+                  brace = text.find('{', match.start(), match.end())
+                  depth = 0
+                  end = None
+                  for i in range(brace, len(text)):
+                      if text[i] == '{': depth += 1
+                      elif text[i] == '}':
+                          depth -= 1
+                          if depth == 0:
+                              end = i + 1
+                              while end < len(text) and text[end].isspace(): end += 1
+                              break
+                  if end is None:
+                      raise RuntimeError(f'unbalanced function {function} in {p}')
+                  text = text[:start] + text[end:]
+              p.write_text(text)
+              print(f'deduplicated {function} in {p}')
+
+          remove_duplicate_functions('supercall/dispatch.c', 'ksu_handle_sys_reboot')
+          remove_duplicate_functions('feature/sucompat.c', 'sh_user_path')
+
+          # On 5.10 sucompat.h aliases ksu_handle_stat_user to ksu_handle_stat;
+          # an injected stat_user definition therefore becomes a duplicate.
+          p = root / 'feature/sucompat.c'
+          text = p.read_text()
+          pattern = re.compile(r'(?m)^int ksu_handle_stat_user\s*\([^;]*?\)\s*\{')
+          match = pattern.search(text)
+          if match:
+              brace = text.find('{', match.start(), match.end())
+              depth = 0
+              for i in range(brace, len(text)):
+                  if text[i] == '{': depth += 1
+                  elif text[i] == '}':
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          while end < len(text) and text[end].isspace(): end += 1
+                          text = text[:match.start()] + text[end:]
+                          p.write_text(text)
+                          print(f'removed 5.10 stat_user alias duplicate in {p}')
+                          break
+          PY
+
+          test "$(grep -c '^int ksu_handle_sys_reboot' kernel/supercall/dispatch.c)" -eq 1
+          test "$(grep -c '^static char __user \*sh_user_path(void)' kernel/feature/sucompat.c)" -eq 1
+          test "$(grep -c '^int ksu_handle_stat_user' kernel/feature/sucompat.c || true)" -eq 0
+
           cd ../common
           patch --forward --batch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch
 
