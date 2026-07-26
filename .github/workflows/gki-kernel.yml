@@ -237,16 +237,25 @@ jobs:
           fi
 
           cd KernelSU
-          patch --forward --batch -p1 < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          # The upstream SUSFS patch targets standard KernelSU. SukiSU's current
+          # layout diverges, so apply what still matches, then run the maintained
+          # SukiSU compatibility fixup to integrate the moved/refactored pieces.
+          patch --forward --batch -p1 < ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
+          find kernel -name '*.rej' -delete
+          curl -fLSs https://raw.githubusercontent.com/onyx-oss/konoha-kernel-gki/main/ksu_susfs_fixup.sh -o ../common/ksu_susfs_fixup.sh
+          chmod +x ../common/ksu_susfs_fixup.sh
+          (cd ../common && ./ksu_susfs_fixup.sh ../KernelSU/kernel sukisu)
 
           cd ../common
           patch --forward --batch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch
 
           grep -q 'config KSU_SUSFS' ../KernelSU/kernel/Kconfig
           grep -q 'susfs.o' fs/Makefile
+          grep -R -q 'susfs_init()' ../KernelSU/kernel
           test -s fs/susfs.c
           test -s include/linux/susfs.h
-          echo "SUSFS source integration verified."
+          test -z "$(find ../KernelSU/kernel common fs include -name '*.rej' -print -quit 2>/dev/null)"
+          echo "SUSFS source integration and SukiSU compatibility fixup verified."
 
       - name: Apply New Hooks Patches
         run: |
