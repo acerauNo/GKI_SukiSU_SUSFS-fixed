@@ -245,6 +245,7 @@ jobs:
           curl -fLSs https://raw.githubusercontent.com/onyx-oss/konoha-kernel-gki/main/ksu_susfs_fixup.sh -o ../common/ksu_susfs_fixup.sh
           chmod +x ../common/ksu_susfs_fixup.sh
           (cd ../common && ./ksu_susfs_fixup.sh ../KernelSU/kernel sukisu)
+          sed -i 's/CMD_SUSFS_ADD_SUS_MOUNT 0x55556/CMD_SUSFS_ADD_SUS_MOUNT 0x55557/' common/include/linux/susfs.h
 
           # Current SukiSU already contains several functions that the generic
           # compatibility script may inject again. Remove only duplicate full
