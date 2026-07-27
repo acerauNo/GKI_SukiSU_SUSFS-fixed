@@ -314,6 +314,25 @@ jobs:
           cd ../common
           patch --forward --batch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch
 
+          # [SUSFS-Fixup] namei.c set_nameidata arity mismatch.
+          # The upstream OPEN_REDIRECT hunk calls set_nameidata(nd, dfd, name, NULL)
+          # with a 4th arg that only exists on >=5.15 trees. On android13-5.10 the
+          # signature is set_nameidata(p, dfd, name) (3 args), so the extra NULL
+          # causes "too many arguments to function call, expected 3, have 4".
+          # Strip the trailing NULL only on 5.10. Idempotent + guarded.
+          if [ "${{ inputs.kernel_version }}" = "5.10" ]; then
+            if grep -qE '^\s*static void set_nameidata\(struct nameidata \*p, int dfd, struct filename \*name\)\s*$' fs/namei.c; then
+              before=$(grep -c 'set_nameidata(nd, old_dfd, fake_filename, NULL)' fs/namei.c || true)
+              sed -i 's/set_nameidata(nd, old_dfd, fake_filename, NULL)/set_nameidata(nd, old_dfd, fake_filename)/g' fs/namei.c
+              after=$(grep -c 'set_nameidata(nd, old_dfd, fake_filename, NULL)' fs/namei.c || true)
+              echo "[SUSFS-Fixup] namei.c set_nameidata: stripped 4th arg from $before call(s), $after remaining"
+              # hard-fail if the 4-arg form somehow survives
+              test "$after" -eq 0
+            else
+              echo "[SUSFS-Fixup] WARNING: 3-arg set_nameidata signature not found on 5.10 tree; skipping arity fixup (upstream may have changed)"
+            fi
+          fi
+
           grep -q 'config KSU_SUSFS' ../KernelSU/kernel/Kconfig
           grep -q 'susfs.o' fs/Makefile
           grep -R -q 'susfs_init()' ../KernelSU/kernel
