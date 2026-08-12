@@ -25,26 +25,6 @@ index 2fec22f7c..ee616de40 100644
  	} else {
  		/*
  		 * A kthread has no context to ERET to, so ensure any buggy
-diff --git a/drivers/Kconfig b/drivers/Kconfig
-index dcecc9f6e..ab37bd739 100644
---- a/drivers/Kconfig
-+++ b/drivers/Kconfig
-@@ -235,4 +235,6 @@ source "drivers/interconnect/Kconfig"
- source "drivers/counter/Kconfig"
- 
- source "drivers/most/Kconfig"
-+source "drivers/frida-kmod/Kconfig"
-+
- endmenu
-diff --git a/drivers/Makefile b/drivers/Makefile
-index 576228037..b32cd2168 100644
---- a/drivers/Makefile
-+++ b/drivers/Makefile
-@@ -189,3 +189,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
- obj-$(CONFIG_INTERCONNECT)	+= interconnect/
- obj-$(CONFIG_COUNTER)		+= counter/
- obj-$(CONFIG_MOST)		+= most/
-+obj-$(CONFIG_FRIDA_KMOD)	+= frida-kmod/
 diff --git a/drivers/frida-kmod/Kconfig b/drivers/frida-kmod/Kconfig
 new file mode 100644
 index 000000000..355414ce5
