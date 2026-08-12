@@ -1,0 +1,991 @@
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index 2fec22f7c..ee616de40 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -376,6 +376,12 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
+ 
+ asmlinkage void ret_from_fork(void) asm("ret_from_fork");
+ 
++#ifdef CONFIG_FRIDA_KMOD
++void frida_kmod_copy_thread_hook(struct task_struct *p,
++				 struct pt_regs *childregs,
++				 unsigned long clone_flags);
++#endif
++
+ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
+ 		unsigned long stk_sz, struct task_struct *p, unsigned long tls)
+ {
+@@ -417,6 +423,9 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
+ 		 */
+ 		if (clone_flags & CLONE_SETTLS)
+ 			p->thread.uw.tp_value = tls;
++#ifdef CONFIG_FRIDA_KMOD
++		frida_kmod_copy_thread_hook(p, childregs, clone_flags);
++#endif
+ 	} else {
+ 		/*
+ 		 * A kthread has no context to ERET to, so ensure any buggy
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index dcecc9f6e..ab37bd739 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -235,4 +235,6 @@ source "drivers/interconnect/Kconfig"
+ source "drivers/counter/Kconfig"
+ 
+ source "drivers/most/Kconfig"
++source "drivers/frida-kmod/Kconfig"
++
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 576228037..b32cd2168 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -189,3 +189,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_INTERCONNECT)	+= interconnect/
+ obj-$(CONFIG_COUNTER)		+= counter/
+ obj-$(CONFIG_MOST)		+= most/
++obj-$(CONFIG_FRIDA_KMOD)	+= frida-kmod/
+diff --git a/drivers/frida-kmod/Kconfig b/drivers/frida-kmod/Kconfig
+new file mode 100644
+index 000000000..355414ce5
+--- /dev/null
++++ b/drivers/frida-kmod/Kconfig
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: GPL-2.0
++config FRIDA_KMOD
++	tristate "Frida kernel-assisted injection channel"
++	default n
++	help
++	  prctl-based control channel that frida-server (kernel-assisted
++	  injector) and frida-agent (GumCloak kernel backend) drive to
++	  allocate memory, spawn threads and cloak memory ranges, threads
++	  and file descriptors inside a target process — without ptrace.
++
++	  Say Y to build it into the kernel image (recommended: no
++	  vermagic/KMI concerns, no module signature wall, invisible
++	  from /proc/modules by definition).
++
++	  If unsure, say N.
+diff --git a/drivers/frida-kmod/Makefile b/drivers/frida-kmod/Makefile
+new file mode 100644
+index 000000000..26388e124
+--- /dev/null
++++ b/drivers/frida-kmod/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_FRIDA_KMOD) += frida_kmod.o
+diff --git a/drivers/frida-kmod/frida_kmod.c b/drivers/frida-kmod/frida_kmod.c
+new file mode 100644
+index 000000000..cdcbf3071
+--- /dev/null
++++ b/drivers/frida-kmod/frida_kmod.c
+@@ -0,0 +1,706 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * frida_kmod.c — Frida kernel-assisted injection channel (built-in driver)
++ *
++ * Implements the prctl-based control channel that frida-core's
++ * src/linux/kernel-injector.vala and frida-gum's gumcloak.c talk to.
++ *
++ * Protocol (both sides agree on these constants):
++ *
++ *   syscall(prctl, 0x46524944 /* "FRID" */, op, arg2, arg3, 0x1d5f9e6b2c7a4038)
++ *
++ * Any call with the wrong option or token falls through to the stock prctl,
++ * so probing the magic against a loaded module looks like a vanilla kernel.
++ *
++ * Ops (gum side — implicit current tgid/mm; the agent runs inside the target):
++ *   ADD_THREAD=1      arg2=tid
++ *   REMOVE_THREAD=2   arg2=tid
++ *   ADD_RANGE=3       arg2=start, arg3=size
++ *   REMOVE_RANGE=4    arg2=start, arg3=size
++ *   ADD_FD=5          arg2=fd
++ *   REMOVE_FD=6       arg2=fd
++ *   PING=32           -> returns 0x46524944
++ *
++ * Ops (frida-server side — explicit target pid, args via user pointer):
++ *   ALLOC=64          struct { u64 size; u32 pid; u32 prot; }
++ *                     -> returns mapped address in the target
++ *   FREE=65           struct { u64 address; u64 size; u32 pid; }
++ *   WRITE=66          struct { u64 address; u64 buffer; u64 size; u32 pid; }
++ *   READ=67           same as WRITE
++ *   SPAWN=68          struct { u64 entry; u64 stack; u64 arg; u64 tls; u32 pid; }
++ *                     -> returns tid of a thread created in the target
++ *   CLOAK_THREAD=69   struct { u32 tgid; u32 tid; }
++ *   CLOAK_RANGE=70    struct { u64 start; u64 size; u32 tgid; }
++ *
++ * Ops 64-70 require root (CAP_SYS_ADMIN): frida-server runs as uid 0.
++ * Gum ops are inherently self-referential (current tgid/mm) so any caller
++ * may only cloak itself — harmless.
++ *
++ * Kernel source patches needed (see frida-kmod.patch):
++ *   kernel/sys.c                       prctl entry hook
++ *   arch/arm64/kernel/process.c        copy_thread hook (pc/x0 of spawned thread)
++ *   kernel/fork.c                      copy_process hook (thread-group retarget)
++ *   fs/proc/base.c                     task readdir/lookup + pid lookup cloaking
++ *   fs/proc/task_mmu.c                 maps/smaps cloaking
++ *   fs/proc/fd.c                       fd enumeration cloaking
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/sched.h>
++#include <linux/sched/mm.h>
++#include <linux/sched/task.h>
++#include <linux/sched/signal.h>
++#include <linux/pid.h>
++#include <linux/highmem.h>
++#include <linux/uaccess.h>
++#include <linux/capability.h>
++#include <asm/current.h>
++
++#define FRIDA_CONTROL_MAGIC	0x46524944UL
++#define FRIDA_CONTROL_TOKEN	0x1d5f9e6b2c7a4038ULL
++
++/* gum ops */
++#define OP_ADD_THREAD		1
++#define OP_REMOVE_THREAD	2
++#define OP_ADD_RANGE		3
++#define OP_REMOVE_RANGE		4
++#define OP_ADD_FD		5
++#define OP_REMOVE_FD		6
++#define OP_PING			32
++
++/* frida-server ops */
++#define OP_ALLOC		64
++#define OP_FREE			65
++#define OP_WRITE		66
++#define OP_READ			67
++#define OP_SPAWN		68
++#define OP_CLOAK_THREAD		69
++#define OP_CLOAK_RANGE		70
++
++#define MAX_XFER		(16U * 1024U * 1024U)
++
++struct alloc_args { u64 size; u32 pid; u32 prot; };
++struct free_args  { u64 address; u64 size; u32 pid; };
++struct xfer_args  { u64 address; u64 buffer; u64 size; u32 pid; };
++struct spawn_args { u64 entry; u64 stack; u64 arg; u64 tls; u32 pid; };
++struct cloak_thread_args { u32 tgid; u32 tid; };
++struct cloak_range_args  { u64 start; u64 size; u32 tgid; };
++
++/* ---- cloak tables ---- */
++struct cloak_tid {
++	u32 tgid, tid;
++	struct list_head list;
++};
++struct cloak_range {
++	struct mm_struct *mm;	/* caller's mm for gum ops, target's for server ops */
++	u64 start, end;
++	struct list_head list;
++};
++struct cloak_fd {
++	u32 tgid, fd;
++	struct list_head list;
++};
++
++static DEFINE_SPINLOCK(cloak_lock);
++static LIST_HEAD(cloak_tids);
++static LIST_HEAD(cloak_ranges);
++static LIST_HEAD(cloak_fds);
++
++bool frida_kmod_tid_hidden(u32 tgid, u32 tid)
++{
++	struct cloak_tid *e;
++	bool hidden = false;
++
++	spin_lock(&cloak_lock);
++	list_for_each_entry(e, &cloak_tids, list) {
++		if (e->tgid == tgid && e->tid == tid) {
++			hidden = true;
++			break;
++		}
++	}
++	spin_unlock(&cloak_lock);
++	return hidden;
++}
++
++bool frida_kmod_range_hidden(struct mm_struct *mm, u64 start, u64 end)
++{
++	struct cloak_range *e;
++	bool hidden = false;
++
++	spin_lock(&cloak_lock);
++	list_for_each_entry(e, &cloak_ranges, list) {
++		if (e->mm == mm && start < e->end && e->start < end) {
++			hidden = true;
++			break;
++		}
++	}
++	spin_unlock(&cloak_lock);
++	return hidden;
++}
++
++bool frida_kmod_fd_hidden(u32 tgid, u32 fd)
++{
++	struct cloak_fd *e;
++	bool hidden = false;
++
++	spin_lock(&cloak_lock);
++	list_for_each_entry(e, &cloak_fds, list) {
++		if (e->tgid == tgid && e->fd == fd) {
++			hidden = true;
++			break;
++		}
++	}
++	spin_unlock(&cloak_lock);
++	return hidden;
++}
++
++static void cloak_tid_add(u32 tgid, u32 tid)
++{
++	struct cloak_tid *e;
++
++	if (frida_kmod_tid_hidden(tgid, tid))
++		return;
++	e = kmalloc(sizeof(*e), GFP_KERNEL);
++	if (!e)
++		return;
++	e->tgid = tgid;
++	e->tid = tid;
++	spin_lock(&cloak_lock);
++	list_add(&e->list, &cloak_tids);
++	spin_unlock(&cloak_lock);
++}
++
++static void cloak_tid_remove(u32 tgid, u32 tid)
++{
++	struct cloak_tid *e, *tmp;
++
++	spin_lock(&cloak_lock);
++	list_for_each_entry_safe(e, tmp, &cloak_tids, list) {
++		if (e->tgid == tgid && e->tid == tid) {
++			list_del(&e->list);
++			kfree(e);
++			break;
++		}
++	}
++	spin_unlock(&cloak_lock);
++}
++
++static void cloak_range_add(struct mm_struct *mm, u64 start, u64 size)
++{
++	struct cloak_range *e;
++
++	if (frida_kmod_range_hidden(mm, start, start + size))
++		return;
++	e = kmalloc(sizeof(*e), GFP_KERNEL);
++	if (!e)
++		return;
++	e->mm = mm;
++	e->start = start;
++	e->end = start + size;
++	spin_lock(&cloak_lock);
++	list_add(&e->list, &cloak_ranges);
++	spin_unlock(&cloak_lock);
++}
++
++static void cloak_range_remove(struct mm_struct *mm, u64 start, u64 size)
++{
++	struct cloak_range *e, *tmp;
++	u64 end = start + size;
++
++	spin_lock(&cloak_lock);
++	list_for_each_entry_safe(e, tmp, &cloak_ranges, list) {
++		if (e->mm == mm && e->start == start && e->end == end) {
++			list_del(&e->list);
++			kfree(e);
++			break;
++		}
++	}
++	spin_unlock(&cloak_lock);
++}
++
++static void cloak_fd_add(u32 tgid, u32 fd)
++{
++	struct cloak_fd *e;
++
++	if (frida_kmod_fd_hidden(tgid, fd))
++		return;
++	e = kmalloc(sizeof(*e), GFP_KERNEL);
++	if (!e)
++		return;
++	e->tgid = tgid;
++	e->fd = fd;
++	spin_lock(&cloak_lock);
++	list_add(&e->list, &cloak_fds);
++	spin_unlock(&cloak_lock);
++}
++
++static void cloak_fd_remove(u32 tgid, u32 fd)
++{
++	struct cloak_fd *e, *tmp;
++
++	spin_lock(&cloak_lock);
++	list_for_each_entry_safe(e, tmp, &cloak_fds, list) {
++		if (e->tgid == tgid && e->fd == fd) {
++			list_del(&e->list);
++			kfree(e);
++			break;
++		}
++	}
++	spin_unlock(&cloak_lock);
++}
++
++/* ---- cross-mm memory ops (frida-server side) ---- */
++
++static struct mm_struct *lookup_mm(u32 pid)
++{
++	struct task_struct *t;
++	struct mm_struct *mm;
++
++	rcu_read_lock();
++	t = find_task_by_vpid((pid_t)pid);
++	if (!t) {
++		rcu_read_unlock();
++		return NULL;
++	}
++	mm = get_task_mm(t);
++	rcu_read_unlock();
++	return mm;
++}
++
++static long op_alloc(u64 size, u32 pid, u32 prot)
++{
++	struct mm_struct *mm, *old_mm;
++	unsigned long addr, populate;
++	long ret;
++
++	if (size == 0 || size > MAX_XFER)
++		return -EINVAL;
++
++	mm = lookup_mm(pid);
++	if (!mm)
++		return -ESRCH;
++
++	if (down_write_killable(&mm->mmap_lock)) {
++		mmput(mm);
++		return -EINTR;
++	}
++
++	/*
++	 * do_mmap() allocates in current->mm. Temporarily swap so the mapping
++	 * lands in the target's address space. We're in a syscall context and
++	 * never return to userspace while swapped, so this is safe.
++	 */
++	old_mm = current->mm;
++	current->mm = mm;
++	addr = do_mmap(NULL, 0, size, prot,
++			MAP_PRIVATE | MAP_ANONYMOUS, 0, &populate, NULL);
++	current->mm = old_mm;
++
++	up_write(&mm->mmap_lock);
++	mmput(mm);
++
++	if (IS_ERR_VALUE(addr))
++		ret = addr;
++	else
++		ret = (long)addr;
++	return ret;
++}
++
++static long op_free(u64 address, u64 size, u32 pid)
++{
++	struct mm_struct *mm;
++	int ret;
++
++	if (size == 0)
++		return -EINVAL;
++
++	mm = lookup_mm(pid);
++	if (!mm)
++		return -ESRCH;
++
++	if (down_write_killable(&mm->mmap_lock)) {
++		mmput(mm);
++		return -EINTR;
++	}
++	ret = do_munmap(mm, (unsigned long)address, (size_t)size, NULL);
++	up_write(&mm->mmap_lock);
++	mmput(mm);
++	return ret;
++}
++
++static long op_read(u64 address, u64 buffer, u64 size, u32 pid)
++{
++	struct mm_struct *mm;
++	void *kbuf;
++	int len;
++	long ret = -EFAULT;
++
++	if (size == 0 || size > MAX_XFER)
++		return -EINVAL;
++
++	mm = lookup_mm(pid);
++	if (!mm)
++		return -ESRCH;
++
++	kbuf = kmalloc(size, GFP_KERNEL);
++	if (!kbuf) {
++		mmput(mm);
++		return -ENOMEM;
++	}
++
++	len = access_remote_vm(mm, (unsigned long)address, kbuf, (int)size, 0);
++	if (len != size)
++		goto out;
++	if (copy_to_user((void __user *)(unsigned long)buffer, kbuf, size))
++		goto out;
++	ret = (long)size;
++out:
++	kfree(kbuf);
++	mmput(mm);
++	return ret;
++}
++
++static long op_write(u64 address, u64 buffer, u64 size, u32 pid)
++{
++	struct mm_struct *mm;
++	void *kbuf;
++	u64 pos = 0;
++	long ret = -EFAULT;
++
++	if (size == 0 || size > MAX_XFER)
++		return -EINVAL;
++
++	mm = lookup_mm(pid);
++	if (!mm)
++		return -ESRCH;
++
++	kbuf = kmalloc(size, GFP_KERNEL);
++	if (!kbuf) {
++		mmput(mm);
++		return -ENOMEM;
++	}
++	if (copy_from_user(kbuf, (void __user *)(unsigned long)buffer, size))
++		goto out;
++
++	while (pos < size) {
++		unsigned long addr = (unsigned long)address + pos;
++		long left = size - pos;
++		int off = offset_in_page(addr);
++		int chunk = min_t(long, left, PAGE_SIZE - off);
++		struct page *page;
++		void *kva;
++
++		if (get_user_pages_remote(mm, addr, 1, FOLL_WRITE,
++					  &page, NULL, NULL) != 1)
++			goto out;
++		kva = kmap(page);
++		memcpy(kva + off, kbuf + pos, chunk);
++		kunmap(page);
++		set_page_dirty_lock(page);
++		put_page(page);
++		pos += chunk;
++	}
++	ret = (long)size;
++out:
++	kfree(kbuf);
++	mmput(mm);
++	return ret;
++}
++
++/* ---- thread spawn (frida-server side) ---- */
++
++struct spawn_pending {
++	bool active;
++	struct task_struct *parent;	/* task that issued SPAWN */
++	u64 entry, arg;
++	/* pre-derived target group identity: */
++	struct task_struct *leader;
++	struct signal_struct *signal;
++	struct sighand_struct *sighand;
++};
++
++static DEFINE_MUTEX(spawn_mutex);
++static struct spawn_pending spawn_pending;
++
++/*
++ * Called from arch/arm64/kernel/process.c:copy_thread(), synchronously
++ * inside our kernel_clone() call, before the child is woken.
++ * Rewrites the child's user entry point and x0.
++ */
++void frida_kmod_copy_thread_hook(struct task_struct *p,
++				 struct pt_regs *childregs,
++				 unsigned long clone_flags)
++{
++	if (!spawn_pending.active)
++		return;
++	if (current != spawn_pending.parent)
++		return;
++
++	childregs->pc = spawn_pending.entry;
++	childregs->regs[0] = spawn_pending.arg;
++}
++
++/*
++ * Called from kernel/fork.c:copy_process(), in the CLONE_THREAD branch,
++ * under tasklist_lock, synchronously inside our kernel_clone() call.
++ * Re-homes the child from frida-server's thread group to the target's.
++ */
++bool frida_kmod_copy_process_hook(struct task_struct *p,
++				  unsigned long clone_flags)
++{
++	struct task_struct *leader;
++	struct signal_struct *sig;
++	struct sighand_struct *sighand;
++
++	if (!spawn_pending.active)
++		return false;
++	if (current != spawn_pending.parent)
++		return false;
++
++	leader = spawn_pending.leader;
++	sig = spawn_pending.signal;
++	sighand = spawn_pending.sighand;
++
++	/* undo frida-server-side accounting (CLONE_THREAD incremented these) */
++	current->signal->nr_threads--;
++	atomic_dec(&current->signal->live);
++	refcount_dec(&current->signal->sigcnt);
++	refcount_dec(&current->sighand->count);
++
++	/* retarget to the target's thread group */
++	p->group_leader = leader;
++	p->tgid = leader->tgid;
++	p->signal = sig;
++	p->sighand = sighand;
++	sig->nr_threads++;
++	atomic_inc(&sig->live);
++	refcount_inc(&sig->sigcnt);
++	refcount_inc(&sighand->count);
++	task_join_group_stop(p);
++
++	list_del_rcu(&p->thread_group);
++	list_add_tail_rcu(&p->thread_group, &leader->thread_group);
++	list_del_rcu(&p->thread_node);
++	list_add_tail_rcu(&p->thread_node, &sig->thread_head);
++
++	/* reparent so the app's reaper collects the zombie on exit */
++	if (p->real_parent != leader) {
++		list_del(&p->sibling);
++		list_add_tail(&p->sibling, &leader->children);
++		p->real_parent = leader;
++	}
++
++	return true;
++}
++
++static long op_spawn(u64 entry, u64 stack, u64 arg, u64 tls, u32 pid)
++{
++	struct task_struct *target;
++	struct mm_struct *tmm, *old_mm;
++	struct kernel_clone_args args = { 0 };
++	pid_t tid;
++	long ret;
++
++	rcu_read_lock();
++	target = find_task_by_vpid((pid_t)pid);
++	if (target)
++		get_task_struct(target);
++	rcu_read_unlock();
++	if (!target)
++		return -ESRCH;
++
++	tmm = get_task_mm(target);
++	if (!tmm) {
++		put_task_struct(target);
++		return -EINVAL;
++	}
++
++	if (!mutex_trylock(&spawn_mutex)) {
++		mmput(tmm);
++		put_task_struct(target);
++		return -EBUSY;
++	}
++
++	spawn_pending.active = true;
++	spawn_pending.parent = current;
++	spawn_pending.entry = entry;
++	spawn_pending.arg = arg;
++	spawn_pending.leader = target->group_leader;
++	spawn_pending.signal = target->signal;
++	spawn_pending.sighand = target->sighand;
++
++	args.flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
++		     CLONE_THREAD | CLONE_SETTLS | CLONE_UNTRACED;
++	args.exit_signal = SIGCHLD;
++	args.stack = (unsigned long)stack;
++	args.tls = (unsigned long)tls;
++
++	/* CLONE_VM shares current->mm: swap so the child joins the target's mm */
++	old_mm = current->mm;
++	current->mm = tmm;
++	tid = kernel_clone(&args);
++	current->mm = old_mm;
++
++	spawn_pending.active = false;
++	mutex_unlock(&spawn_mutex);
++
++	mmput(tmm);
++	put_task_struct(target);
++
++	if (tid < 0)
++		ret = tid;
++	else
++		ret = (long)tid;
++	return ret;
++}
++
++/* ---- prctl entry hook (called from kernel/sys.c) ---- */
++
++long frida_kmod_prctl_hook(int option, unsigned long arg2,
++			   unsigned long arg3, unsigned long arg4,
++			   unsigned long arg5, long *ret)
++{
++	u32 op;
++	struct alloc_args aa;
++	struct free_args fa;
++	struct xfer_args xa;
++	struct spawn_args sa;
++	struct cloak_thread_args cta;
++	struct cloak_range_args cra;
++
++	if (option != FRIDA_CONTROL_MAGIC || arg5 != FRIDA_CONTROL_TOKEN)
++		return 0;	/* passthrough to stock prctl */
++
++	op = (u32)arg2;
++	*ret = 0;
++
++	switch (op) {
++	case OP_ADD_THREAD:
++		cloak_tid_add(current->tgid, (u32)arg3);
++		return 1;
++	case OP_REMOVE_THREAD:
++		cloak_tid_remove(current->tgid, (u32)arg3);
++		return 1;
++	case OP_ADD_RANGE:
++		cloak_range_add(current->mm, (u64)arg3, (u64)arg4);
++		return 1;
++	case OP_REMOVE_RANGE:
++		cloak_range_remove(current->mm, (u64)arg3, (u64)arg4);
++		return 1;
++	case OP_ADD_FD:
++		cloak_fd_add(current->tgid, (u32)arg3);
++		return 1;
++	case OP_REMOVE_FD:
++		cloak_fd_remove(current->tgid, (u32)arg3);
++		return 1;
++	case OP_PING:
++		*ret = FRIDA_CONTROL_MAGIC;
++		return 1;
++	default:
++		break;
++	}
++
++	/* server-side ops: root only */
++	if (!capable(CAP_SYS_ADMIN)) {
++		*ret = -EPERM;
++		return 1;
++	}
++
++	switch (op) {
++	case OP_ALLOC:
++		if (copy_from_user(&aa, (void __user *)arg3, sizeof(aa)))
++			*ret = -EFAULT;
++		else
++			*ret = op_alloc(aa.size, aa.pid, aa.prot);
++		return 1;
++	case OP_FREE:
++		if (copy_from_user(&fa, (void __user *)arg3, sizeof(fa)))
++			*ret = -EFAULT;
++		else
++			*ret = op_free(fa.address, fa.size, fa.pid);
++		return 1;
++	case OP_READ:
++		if (copy_from_user(&xa, (void __user *)arg3, sizeof(xa)))
++			*ret = -EFAULT;
++		else
++			*ret = op_read(xa.address, xa.buffer, xa.size, xa.pid);
++		return 1;
++	case OP_WRITE:
++		if (copy_from_user(&xa, (void __user *)arg3, sizeof(xa)))
++			*ret = -EFAULT;
++		else
++			*ret = op_write(xa.address, xa.buffer, xa.size, xa.pid);
++		return 1;
++	case OP_SPAWN:
++		if (copy_from_user(&sa, (void __user *)arg3, sizeof(sa)))
++			*ret = -EFAULT;
++		else
++			*ret = op_spawn(sa.entry, sa.stack, sa.arg, sa.tls, sa.pid);
++		return 1;
++	case OP_CLOAK_THREAD:
++		if (copy_from_user(&cta, (void __user *)arg3, sizeof(cta)))
++			*ret = -EFAULT;
++		else
++			cloak_tid_add(cta.tgid, cta.tid);
++		return 1;
++	case OP_CLOAK_RANGE: {
++		struct mm_struct *mm;
++
++		if (copy_from_user(&cra, (void __user *)arg3, sizeof(cra))) {
++			*ret = -EFAULT;
++			return 1;
++		}
++		mm = lookup_mm(cra.tgid);
++		if (!mm) {
++			*ret = -ESRCH;
++			return 1;
++		}
++		cloak_range_add(mm, cra.start, cra.size);
++		mmput(mm);
++		return 1;
++	}
++	default:
++		*ret = -ENOSYS;
++		return 1;
++	}
++}
++
++static int __init frida_kmod_init(void)
++{
++	pr_info("frida_kmod: kernel-assisted injection channel active\n");
++	return 0;
++}
++
++static void __exit frida_kmod_exit(void)
++{
++	struct cloak_tid *te, *ttmp;
++	struct cloak_range *re, *rtmp;
++	struct cloak_fd *fe, *ftmp;
++
++	spin_lock(&cloak_lock);
++	list_for_each_entry_safe(te, ttmp, &cloak_tids, list) {
++		list_del(&te->list);
++		kfree(te);
++	}
++	list_for_each_entry_safe(re, rtmp, &cloak_ranges, list) {
++		list_del(&re->list);
++		kfree(re);
++	}
++	list_for_each_entry_safe(fe, ftmp, &cloak_fds, list) {
++		list_del(&fe->list);
++		kfree(fe);
++	}
++	spin_unlock(&cloak_lock);
++	pr_info("frida_kmod: removed\n");
++}
++
++module_init(frida_kmod_init);
++module_exit(frida_kmod_exit);
++MODULE_LICENSE("GPL");
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index d0884f38c..8b54771eb 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -3476,6 +3476,10 @@ struct dentry *proc_pid_lookup(struct dentry *dentry, unsigned int flags)
+ 		if (!has_pid_permissions(fs_info, task, HIDEPID_NO_ACCESS))
+ 			goto out_put_task;
+ 	}
++#ifdef CONFIG_FRIDA_KMOD
++	if (frida_kmod_tid_hidden(task_tgid_nr_ns(task, ns), tgid))
++		goto out_put_task;
++#endif
+ 
+ 	result = proc_pid_instantiate(dentry, task, NULL);
+ out_put_task:
+@@ -3776,6 +3780,10 @@ static struct dentry *proc_task_lookup(struct inode *dir, struct dentry * dentry
+ 		goto out;
+ 	if (!same_thread_group(leader, task))
+ 		goto out_drop_task;
++#ifdef CONFIG_FRIDA_KMOD
++	if (frida_kmod_tid_hidden(task_tgid_nr_ns(leader, ns), tid))
++		goto out_drop_task;
++#endif
+ 
+ 	result = proc_task_instantiate(dentry, task, NULL);
+ out_drop_task:
+@@ -3864,6 +3872,10 @@ static struct task_struct *next_tid(struct task_struct *start)
+ }
+ 
+ /* for the /proc/TGID/task/ directories */
++#ifdef CONFIG_FRIDA_KMOD
++bool frida_kmod_tid_hidden(u32 tgid, u32 tid);
++#endif
++
+ static int proc_task_readdir(struct file *file, struct dir_context *ctx)
+ {
+ 	struct inode *inode = file_inode(file);
+@@ -3889,6 +3901,10 @@ static int proc_task_readdir(struct file *file, struct dir_context *ctx)
+ 		char name[10 + 1];
+ 		unsigned int len;
+ 		tid = task_pid_nr_ns(task, ns);
++#ifdef CONFIG_FRIDA_KMOD
++		if (frida_kmod_tid_hidden(task_tgid_nr_ns(task, ns), tid))
++			continue;
++#endif
+ 		len = snprintf(name, sizeof(name), "%u", tid);
+ 		if (!proc_fill_cache(file, ctx, name, len,
+ 				proc_task_instantiate, task, NULL)) {
+diff --git a/fs/proc/fd.c b/fs/proc/fd.c
+index 6b634c0a9..c5e2a77c9 100644
+--- a/fs/proc/fd.c
++++ b/fs/proc/fd.c
+@@ -227,12 +227,19 @@ static struct dentry *proc_fd_instantiate(struct dentry *dentry,
+ 	return d_splice_alias(inode, dentry);
+ }
+ 
++#ifdef CONFIG_FRIDA_KMOD
++bool frida_kmod_fd_hidden(u32 tgid, u32 fd);
++#endif
++
+ static struct dentry *proc_lookupfd_common(struct inode *dir,
+ 					   struct dentry *dentry,
+ 					   instantiate_t instantiate)
+ {
+ 	struct task_struct *task = get_proc_task(dir);
+ 	struct fd_data data = {.fd = name_to_int(&dentry->d_name)};
++#ifdef CONFIG_FRIDA_KMOD
++	struct pid_namespace *ns;
++#endif
+ 	struct dentry *result = ERR_PTR(-ENOENT);
+ 
+ 	if (!task)
+@@ -241,6 +248,11 @@ static struct dentry *proc_lookupfd_common(struct inode *dir,
+ 		goto out;
+ 	if (!tid_fd_mode(task, data.fd, &data.mode))
+ 		goto out;
++#ifdef CONFIG_FRIDA_KMOD
++	ns = proc_pid_ns(dentry->d_sb);
++	if (frida_kmod_fd_hidden(task_tgid_nr_ns(task, ns), data.fd))
++		goto out;
++#endif
+ 
+ 	result = instantiate(dentry, task, &data);
+ out:
+@@ -254,6 +266,9 @@ static int proc_readfd_common(struct file *file, struct dir_context *ctx,
+ {
+ 	struct task_struct *p = get_proc_task(file_inode(file));
+ 	struct files_struct *files;
++#ifdef CONFIG_FRIDA_KMOD
++	struct pid_namespace *ns;
++#endif
+ 	unsigned int fd;
+ 
+ 	if (!p)
+@@ -264,6 +279,9 @@ static int proc_readfd_common(struct file *file, struct dir_context *ctx,
+ 	files = get_files_struct(p);
+ 	if (!files)
+ 		goto out;
++#ifdef CONFIG_FRIDA_KMOD
++	ns = proc_pid_ns(file_inode(file)->i_sb);
++#endif
+ 
+ 	rcu_read_lock();
+ 	for (fd = ctx->pos - 2;
+@@ -277,6 +295,10 @@ static int proc_readfd_common(struct file *file, struct dir_context *ctx,
+ 		f = fcheck_files(files, fd);
+ 		if (!f)
+ 			continue;
++#ifdef CONFIG_FRIDA_KMOD
++		if (frida_kmod_fd_hidden(task_tgid_nr_ns(p, ns), fd))
++			continue;
++#endif
+ 		data.mode = f->f_mode;
+ 		rcu_read_unlock();
+ 		data.fd = fd;
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index ba8eb5dc6..d8e42f833 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -343,10 +343,18 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+ 	seq_putc(m, '\n');
+ }
+ 
++#ifdef CONFIG_FRIDA_KMOD
++bool frida_kmod_range_hidden(struct mm_struct *mm, u64 start, u64 end);
++#endif
++
+ static int show_map(struct seq_file *m, void *v)
+ {
+ 	struct vm_area_struct *pad_vma = get_pad_vma(v);
+ 	struct vm_area_struct *vma = get_data_vma(v);
++#ifdef CONFIG_FRIDA_KMOD
++	if (frida_kmod_range_hidden(vma->vm_mm, vma->vm_start, vma->vm_end))
++		return 0;
++#endif
+ 
+ 	if (vma_pages(vma))
+ 		show_map_vma(m, vma);
+@@ -851,6 +859,10 @@ static int show_smap(struct seq_file *m, void *v)
+ {
+ 	struct vm_area_struct *pad_vma = get_pad_vma(v);
+ 	struct vm_area_struct *vma = get_data_vma(v);
++#ifdef CONFIG_FRIDA_KMOD
++	if (frida_kmod_range_hidden(vma->vm_mm, vma->vm_start, vma->vm_end))
++		return 0;
++#endif
+ 	struct mem_size_stats mss;
+ 
+ 	memset(&mss, 0, sizeof(mss));
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 7a2fd403f..2a0775d4e 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2002,6 +2002,11 @@ static void copy_oom_score_adj(u64 clone_flags, struct task_struct *tsk)
+  * parts of the process environment (as per the clone
+  * flags). The actual kick-off is left to the caller.
+  */
++#ifdef CONFIG_FRIDA_KMOD
++bool frida_kmod_copy_process_hook(struct task_struct *p,
++				  unsigned long clone_flags);
++#endif
++
+ static __latent_entropy struct task_struct *copy_process(
+ 					struct pid *pid,
+ 					int trace,
+@@ -2462,8 +2467,11 @@ static __latent_entropy struct task_struct *copy_process(
+ 			list_add_tail_rcu(&p->thread_group,
+ 					  &p->group_leader->thread_group);
+ 			list_add_tail_rcu(&p->thread_node,
+-					  &p->signal->thread_head);
++				  &p->signal->thread_head);
+ 		}
++#ifdef CONFIG_FRIDA_KMOD
++		frida_kmod_copy_process_hook(p, clone_flags);
++#endif
+ 		attach_pid(p, PIDTYPE_PID);
+ 		nr_threads++;
+ 	}
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 4e9627616..bd35465d0 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2372,9 +2372,20 @@ static int prctl_set_vma(unsigned long opt, unsigned long start,
+ }
+ #endif /* CONFIG_ANON_VMA_NAME */
+ 
++#ifdef CONFIG_FRIDA_KMOD
++long frida_kmod_prctl_hook(int option, unsigned long arg2, unsigned long arg3,
++			   unsigned long arg4, unsigned long arg5, long *ret);
++#endif
++
+ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
+ 		unsigned long, arg4, unsigned long, arg5)
+ {
++#ifdef CONFIG_FRIDA_KMOD
++	long frida_ret;
++
++	if (frida_kmod_prctl_hook(option, arg2, arg3, arg4, arg5, &frida_ret))
++		return frida_ret;
++#endif
+ 	struct task_struct *me = current;
+ 	unsigned char comm[sizeof(me->comm)];
+ 	long error;

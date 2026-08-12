@@ -352,6 +352,29 @@ jobs:
             patch -p1 -F 3 < scope_min_manual_hooks_v1.6.patch
           fi
 
+      - name: Apply FRIDA KMOD (kernel-assisted injector)
+        run: |
+          set -euo pipefail
+          echo "Changing to configuration directory: $CONFIG..."
+          cd "$CONFIG/common"
+
+          cp "$GITHUB_WORKSPACE/kernel_patches/frida-kmod.patch" ./
+          patch -p1 --forward --batch < frida-kmod.patch
+
+          echo "CONFIG_FRIDA_KMOD=y" >> arch/arm64/configs/gki_defconfig
+
+          # hard verification
+          grep -q 'frida_kmod_prctl_hook' kernel/sys.c
+          grep -q 'frida_kmod_copy_thread_hook' arch/arm64/kernel/process.c
+          grep -q 'frida_kmod_copy_process_hook' kernel/fork.c
+          grep -q 'frida_kmod_tid_hidden' fs/proc/base.c
+          grep -q 'frida_kmod_range_hidden' fs/proc/task_mmu.c
+          grep -q 'frida_kmod_fd_hidden' fs/proc/fd.c
+          grep -q 'CONFIG_FRIDA_KMOD=y' arch/arm64/configs/gki_defconfig
+          test -f drivers/frida-kmod/frida_kmod.c
+          test -z "$(find . -name '*.rej' -print -quit 2>/dev/null)"
+          echo "FRIDA_KMOD integration verified."
+
       # - name: Apply Hide Stuff Patches
       #   run: |
       #     echo "Changing to configuration directory: $CONFIG..."
