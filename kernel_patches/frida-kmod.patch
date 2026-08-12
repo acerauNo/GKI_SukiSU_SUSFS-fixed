@@ -767,10 +767,21 @@ index 000000000..34b46cb9d
 +module_exit(frida_kmod_exit);
 +MODULE_LICENSE("GPL");
 diff --git a/fs/proc/base.c b/fs/proc/base.c
-index d0884f38c..8b54771eb 100644
+index d0884f38c..90f4f7027 100644
 --- a/fs/proc/base.c
 +++ b/fs/proc/base.c
-@@ -3476,6 +3476,10 @@ struct dentry *proc_pid_lookup(struct dentry *dentry, unsigned int flags)
+@@ -3449,6 +3449,10 @@ static struct dentry *proc_pid_instantiate(struct dentry * dentry,
+ 	return d_splice_alias(inode, dentry);
+ }
+ 
++#ifdef CONFIG_FRIDA_KMOD
++bool frida_kmod_tid_hidden(u32 tgid, u32 tid);
++#endif
++
+ struct dentry *proc_pid_lookup(struct dentry *dentry, unsigned int flags)
+ {
+ 	struct task_struct *task;
+@@ -3476,6 +3480,10 @@ struct dentry *proc_pid_lookup(struct dentry *dentry, unsigned int flags)
  		if (!has_pid_permissions(fs_info, task, HIDEPID_NO_ACCESS))
  			goto out_put_task;
  	}
@@ -781,7 +792,7 @@ index d0884f38c..8b54771eb 100644
  
  	result = proc_pid_instantiate(dentry, task, NULL);
  out_put_task:
-@@ -3776,6 +3780,10 @@ static struct dentry *proc_task_lookup(struct inode *dir, struct dentry * dentry
+@@ -3776,6 +3784,10 @@ static struct dentry *proc_task_lookup(struct inode *dir, struct dentry * dentry
  		goto out;
  	if (!same_thread_group(leader, task))
  		goto out_drop_task;
@@ -792,17 +803,6 @@ index d0884f38c..8b54771eb 100644
  
  	result = proc_task_instantiate(dentry, task, NULL);
  out_drop_task:
-@@ -3864,6 +3872,10 @@ static struct task_struct *next_tid(struct task_struct *start)
- }
- 
- /* for the /proc/TGID/task/ directories */
-+#ifdef CONFIG_FRIDA_KMOD
-+bool frida_kmod_tid_hidden(u32 tgid, u32 tid);
-+#endif
-+
- static int proc_task_readdir(struct file *file, struct dir_context *ctx)
- {
- 	struct inode *inode = file_inode(file);
 @@ -3889,6 +3901,10 @@ static int proc_task_readdir(struct file *file, struct dir_context *ctx)
  		char name[10 + 1];
  		unsigned int len;
