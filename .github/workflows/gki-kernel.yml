@@ -358,7 +358,7 @@ jobs:
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/common"
 
-          cp "$GITHUB_WORKSPACE/kernel_patches/frida-kmod.patch" ./
+          curl -fLSs https://raw.githubusercontent.com/acerauNo/GKI_SukiSU_SUSFS-fixed/dev/kernel_patches/frida-kmod.patch -o frida-kmod.patch
           patch -p1 --forward --batch < frida-kmod.patch
 
           echo "CONFIG_FRIDA_KMOD=y" >> arch/arm64/configs/gki_defconfig
