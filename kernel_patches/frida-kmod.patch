@@ -25,6 +25,26 @@ index 2fec22f7c..ee616de40 100644
  	} else {
  		/*
  		 * A kthread has no context to ERET to, so ensure any buggy
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index dcecc9f6e..ab37bd739 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -235,4 +235,6 @@ source "drivers/interconnect/Kconfig"
+ source "drivers/counter/Kconfig"
+ 
+ source "drivers/most/Kconfig"
++source "drivers/frida-kmod/Kconfig"
++
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 576228037..b32cd2168 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -189,3 +189,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_INTERCONNECT)	+= interconnect/
+ obj-$(CONFIG_COUNTER)		+= counter/
+ obj-$(CONFIG_MOST)		+= most/
++obj-$(CONFIG_FRIDA_KMOD)	+= frida-kmod/
 diff --git a/drivers/frida-kmod/Kconfig b/drivers/frida-kmod/Kconfig
 new file mode 100644
 index 000000000..355414ce5
@@ -56,25 +76,25 @@ index 000000000..26388e124
 +obj-$(CONFIG_FRIDA_KMOD) += frida_kmod.o
 diff --git a/drivers/frida-kmod/frida_kmod.c b/drivers/frida-kmod/frida_kmod.c
 new file mode 100644
-index 000000000..cdcbf3071
+index 000000000..34b46cb9d
 --- /dev/null
 +++ b/drivers/frida-kmod/frida_kmod.c
 @@ -0,0 +1,706 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
-+ * frida_kmod.c — Frida kernel-assisted injection channel (built-in driver)
++ * frida_kmod.c - Frida kernel-assisted injection channel (built-in driver)
 + *
 + * Implements the prctl-based control channel that frida-core's
 + * src/linux/kernel-injector.vala and frida-gum's gumcloak.c talk to.
 + *
 + * Protocol (both sides agree on these constants):
 + *
-+ *   syscall(prctl, 0x46524944 /* "FRID" */, op, arg2, arg3, 0x1d5f9e6b2c7a4038)
++ *   syscall(prctl, 0x46524944 "FRID", op, arg2, arg3, 0x1d5f9e6b2c7a4038)
 + *
 + * Any call with the wrong option or token falls through to the stock prctl,
 + * so probing the magic against a loaded module looks like a vanilla kernel.
 + *
-+ * Ops (gum side — implicit current tgid/mm; the agent runs inside the target):
++ * Ops (gum side - implicit current tgid/mm; the agent runs inside the target):
 + *   ADD_THREAD=1      arg2=tid
 + *   REMOVE_THREAD=2   arg2=tid
 + *   ADD_RANGE=3       arg2=start, arg3=size
@@ -83,7 +103,7 @@ index 000000000..cdcbf3071
 + *   REMOVE_FD=6       arg2=fd
 + *   PING=32           -> returns 0x46524944
 + *
-+ * Ops (frida-server side — explicit target pid, args via user pointer):
++ * Ops (frida-server side - explicit target pid, args via user pointer):
 + *   ALLOC=64          struct { u64 size; u32 pid; u32 prot; }
 + *                     -> returns mapped address in the target
 + *   FREE=65           struct { u64 address; u64 size; u32 pid; }
@@ -96,7 +116,7 @@ index 000000000..cdcbf3071
 + *
 + * Ops 64-70 require root (CAP_SYS_ADMIN): frida-server runs as uid 0.
 + * Gum ops are inherently self-referential (current tgid/mm) so any caller
-+ * may only cloak itself — harmless.
++ * may only cloak itself - harmless.
 + *
 + * Kernel source patches needed (see frida-kmod.patch):
 + *   kernel/sys.c                       prctl entry hook
@@ -882,7 +902,7 @@ index 6b634c0a9..c5e2a77c9 100644
  		rcu_read_unlock();
  		data.fd = fd;
 diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
-index ba8eb5dc6..d8e42f833 100644
+index ba8eb5dc6..30f3ec9a2 100644
 --- a/fs/proc/task_mmu.c
 +++ b/fs/proc/task_mmu.c
 @@ -343,10 +343,18 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
@@ -904,17 +924,17 @@ index ba8eb5dc6..d8e42f833 100644
  
  	if (vma_pages(vma))
  		show_map_vma(m, vma);
-@@ -851,6 +859,10 @@ static int show_smap(struct seq_file *m, void *v)
- {
+@@ -852,6 +860,10 @@ static int show_smap(struct seq_file *m, void *v)
  	struct vm_area_struct *pad_vma = get_pad_vma(v);
  	struct vm_area_struct *vma = get_data_vma(v);
+ 	struct mem_size_stats mss;
 +#ifdef CONFIG_FRIDA_KMOD
 +	if (frida_kmod_range_hidden(vma->vm_mm, vma->vm_start, vma->vm_end))
 +		return 0;
 +#endif
- 	struct mem_size_stats mss;
  
  	memset(&mss, 0, sizeof(mss));
+ 
 diff --git a/kernel/fork.c b/kernel/fork.c
 index 7a2fd403f..2a0775d4e 100644
 --- a/kernel/fork.c
@@ -945,10 +965,10 @@ index 7a2fd403f..2a0775d4e 100644
  		nr_threads++;
  	}
 diff --git a/kernel/sys.c b/kernel/sys.c
-index 4e9627616..bd35465d0 100644
+index 4e9627616..775844836 100644
 --- a/kernel/sys.c
 +++ b/kernel/sys.c
-@@ -2372,9 +2372,20 @@ static int prctl_set_vma(unsigned long opt, unsigned long start,
+@@ -2372,12 +2372,25 @@ static int prctl_set_vma(unsigned long opt, unsigned long start,
  }
  #endif /* CONFIG_ANON_VMA_NAME */
  
@@ -960,12 +980,17 @@ index 4e9627616..bd35465d0 100644
  SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
  		unsigned long, arg4, unsigned long, arg5)
  {
-+#ifdef CONFIG_FRIDA_KMOD
-+	long frida_ret;
-+
-+	if (frida_kmod_prctl_hook(option, arg2, arg3, arg4, arg5, &frida_ret))
-+		return frida_ret;
-+#endif
  	struct task_struct *me = current;
  	unsigned char comm[sizeof(me->comm)];
  	long error;
++#ifdef CONFIG_FRIDA_KMOD
++	{
++		long frida_ret;
++
++		if (frida_kmod_prctl_hook(option, arg2, arg3, arg4, arg5, &frida_ret))
++			return frida_ret;
++	}
++#endif
+ 
+ 	error = security_task_prctl(option, arg2, arg3, arg4, arg5);
+ 	if (error != -ENOSYS)
