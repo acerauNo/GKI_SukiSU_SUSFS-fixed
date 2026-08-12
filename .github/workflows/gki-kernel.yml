@@ -361,6 +361,12 @@ jobs:
           curl -fLSs https://raw.githubusercontent.com/acerauNo/GKI_SukiSU_SUSFS-fixed/dev/kernel_patches/frida-kmod.patch -o frida-kmod.patch
           patch -p1 --forward --batch < frida-kmod.patch
 
+          # register driver (append-style: survives SukiSU's own drivers/Kconfig + Makefile edits)
+          grep -q 'frida-kmod' drivers/Makefile || printf 'obj-$(CONFIG_FRIDA_KMOD)	+= frida-kmod/
+' >> drivers/Makefile
+          grep -q 'frida-kmod' drivers/Kconfig || printf 'source "drivers/frida-kmod/Kconfig"
+' >> drivers/Kconfig
+
           echo "CONFIG_FRIDA_KMOD=y" >> arch/arm64/configs/gki_defconfig
 
           # hard verification
