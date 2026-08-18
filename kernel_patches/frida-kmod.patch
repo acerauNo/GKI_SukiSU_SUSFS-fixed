@@ -25,26 +25,6 @@ index 2fec22f7c..ee616de40 100644
  	} else {
  		/*
  		 * A kthread has no context to ERET to, so ensure any buggy
-diff --git a/drivers/Kconfig b/drivers/Kconfig
-index dcecc9f6e..ab37bd739 100644
---- a/drivers/Kconfig
-+++ b/drivers/Kconfig
-@@ -235,4 +235,6 @@ source "drivers/interconnect/Kconfig"
- source "drivers/counter/Kconfig"
- 
- source "drivers/most/Kconfig"
-+source "drivers/frida-kmod/Kconfig"
-+
- endmenu
-diff --git a/drivers/Makefile b/drivers/Makefile
-index 576228037..b32cd2168 100644
---- a/drivers/Makefile
-+++ b/drivers/Makefile
-@@ -189,3 +189,4 @@ obj-$(CONFIG_GNSS)		+= gnss/
- obj-$(CONFIG_INTERCONNECT)	+= interconnect/
- obj-$(CONFIG_COUNTER)		+= counter/
- obj-$(CONFIG_MOST)		+= most/
-+obj-$(CONFIG_FRIDA_KMOD)	+= frida-kmod/
 diff --git a/drivers/frida-kmod/Kconfig b/drivers/frida-kmod/Kconfig
 new file mode 100644
 index 000000000..355414ce5
@@ -76,10 +56,10 @@ index 000000000..26388e124
 +obj-$(CONFIG_FRIDA_KMOD) += frida_kmod.o
 diff --git a/drivers/frida-kmod/frida_kmod.c b/drivers/frida-kmod/frida_kmod.c
 new file mode 100644
-index 000000000..b53594301
+index 000000000..34b46cb9d
 --- /dev/null
 +++ b/drivers/frida-kmod/frida_kmod.c
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,719 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * frida_kmod.c - Frida kernel-assisted injection channel (built-in driver)
@@ -139,6 +119,7 @@ index 000000000..b53594301
 +#include <linux/sched/mm.h>
 +#include <linux/sched/task.h>
 +#include <linux/sched/signal.h>
++#include <linux/fdtable.h>
 +#include <linux/pid.h>
 +#include <linux/highmem.h>
 +#include <linux/uaccess.h>
@@ -568,14 +549,8 @@ index 000000000..b53594301
 +	task_join_group_stop(p);
 +
 +	/*
-+	 * The SPAWN opcode clones with CLONE_FILES, so the child shares the
-+	 * *server's* files_struct. The injected loader then does getpid() ->
-+	 * target tgid and dlopens /proc/<target>/fd/<n>, which resolves against
-+	 * the target's OWN fd table — the SCM_RIGHTS agent fd never landed
-+	 * there, so dlopen fails ("library /proc/<pid>/fd/N not found") and the
-+	 * wedged bootstrap thread hangs the system (AP watchdog reboot).
-+	 * Swap the child to the target's files_struct so the received agent fd
-+	 * lands in the table the loader then resolves.
++	 * SPAWN clones with CLONE_FILES, child shares server's files_struct.
++	 * Swap to target's so agent fd lands where loader resolves.
 +	 */
 +	if (p->files != leader->files) {
 +		struct files_struct *new_files = get_files_struct(leader);
