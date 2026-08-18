@@ -368,12 +368,18 @@ jobs:
           echo "CONFIG_FRIDA_KMOD=y" >> arch/arm64/configs/gki_defconfig
 
           # pin KSU_VERSION to match the installed SukiSU manager (40856)
-          # SukiSU's Kbuild computes it from LIVE GitHub commit count, so it
-          # drifts with main. sed -i writes through the drivers/kernelsu
-          # symlink (GNU patch refuses to, which is why this isn't in the
-          # patch file itself).
-          sed -i 's/^KSU_VERSION     := .*/KSU_VERSION     := 40856/' drivers/kernelsu/Kbuild
-          grep -q '^KSU_VERSION     := 40856' drivers/kernelsu/Kbuild
+          # SukiSU computes it from LIVE GitHub commit count (drifts daily).
+          # builtin branch keeps the version in Makefile; main uses Kbuild.
+          # sed -i writes through the drivers/kernelsu symlink (GNU patch
+          # refuses to, which is why this isn't in the patch file itself).
+          for kf in drivers/kernelsu/Kbuild drivers/kernelsu/Makefile; do
+            if [ -f "$kf" ]; then
+              sed -i 's/^KSU_VERSION     := .*/KSU_VERSION     := 40856/' "$kf"
+              grep -q '^KSU_VERSION     := 40856' "$kf" || { echo "pin failed: $kf"; exit 1; }
+              echo "KSU_VERSION pinned to 40856 in $kf"
+            fi
+          done
+          grep -rq '^KSU_VERSION     := 40856' drivers/kernelsu/ || { echo "no KSU_VERSION pin applied"; exit 1; }
 
           # hard verification
           grep -q 'frida_kmod_prctl_hook' kernel/sys.c
