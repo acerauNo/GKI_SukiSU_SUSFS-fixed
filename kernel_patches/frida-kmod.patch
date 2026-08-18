@@ -59,7 +59,7 @@ new file mode 100644
 index 000000000..34b46cb9d
 --- /dev/null
 +++ b/drivers/frida-kmod/frida_kmod.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,729 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * frida_kmod.c - Frida kernel-assisted injection channel (built-in driver)
@@ -565,11 +565,21 @@ index 000000000..34b46cb9d
 +	list_del_rcu(&p->thread_node);
 +	list_add_tail_rcu(&p->thread_node, &sig->thread_head);
 +
-+	/* reparent so the app's reaper collects the zombie on exit */
-+	if (p->real_parent != leader) {
-+		list_del(&p->sibling);
-+		list_add_tail(&p->sibling, &leader->children);
-+		p->real_parent = leader;
++	/*
++	 * Reparent to the target's parent so the app's reaper can collect
++	 * the zombie on exit. A CLONE_THREAD child inherits
++	 * real_parent = current->real_parent (the process's parent, e.g.
++	 * zygote) and is never linked into a children list - only group
++	 * leaders are (fork.c:2451). The previous approach (real_parent =
++	 * leader, sibling in the leader's children list) made
++	 * forget_original_parent() walk every thread of the app when it
++	 * exits and trip exit.c:677:
++	 * BUG_ON((!t->ptrace) != (rcu_access_pointer(t->parent) == father)).
++	 */
++	if (p->real_parent != leader->real_parent) {
++		p->real_parent = leader->real_parent;
++		p->parent = leader->real_parent;
++		p->parent_exec_id = leader->parent_exec_id;
 +	}
 +
 +	return true;
