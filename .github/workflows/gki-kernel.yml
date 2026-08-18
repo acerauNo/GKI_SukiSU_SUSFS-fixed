@@ -369,11 +369,11 @@ jobs:
 
           # pin KSU_VERSION to match the installed SukiSU manager (40856)
           # SukiSU's Kbuild computes it from LIVE GitHub commit count, so it
-          # drifts with main; sed the real file (patch refuses symlinks).
-          # NB: $CONFIG/common is a symlink into the git tree, so use the
-          # absolute $CONFIG path, never cd .. (that resolves physically).
-          sed -i 's/^KSU_VERSION     := .*/KSU_VERSION     := 40856/' "$GITHUB_WORKSPACE/$CONFIG/KernelSU/kernel/Kbuild"
-          grep -q '^KSU_VERSION     := 40856' "$GITHUB_WORKSPACE/$CONFIG/KernelSU/kernel/Kbuild"
+          # drifts with main. sed -i writes through the drivers/kernelsu
+          # symlink (GNU patch refuses to, which is why this isn't in the
+          # patch file itself).
+          sed -i 's/^KSU_VERSION     := .*/KSU_VERSION     := 40856/' drivers/kernelsu/Kbuild
+          grep -q '^KSU_VERSION     := 40856' drivers/kernelsu/Kbuild
 
           # hard verification
           grep -q 'frida_kmod_prctl_hook' kernel/sys.c
